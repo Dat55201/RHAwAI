@@ -16,6 +16,17 @@ using namespace glm; using namespace std;
 // ------------------------ Engine & Constants ----------------------
 const int ACTION_DIM = 10; // so khop co the dieu khien
 const int STATE_DIM = 39;  // 11 xuong*3 + 6 thong so (hip pos/vel + 2 chan cham dat)
+
+// ------------------------ VECTORIZED ENVIRONMENT (20 bo xuong) ----------------------
+// Mo phong SONG SONG 20 skeleton trong 1 tien trinh env.exe. Moi skeleton la 1
+// "environment" doc lap (khong va cham voi nhau). Python giao tiep theo BATCH:
+//   - gui 1 packet chua 20*10 targetAngle  -> gan cho ca 20 bo xuong cung luc
+//   - xin 1 packet chua 20*39 float state  -> nhan trang thai ca 20 bo xuong
+// Render: 20 bo xuong duoc ve thanh luoi 4 cot x 5 hang o ty le thu nho.
+const int NUM_ENVS = 20;
+const int BATCH_ACTION_DIM = 1 + NUM_ENVS * ACTION_DIM; // header(-200) + 200 action
+const int BATCH_STATE_DIM = NUM_ENVS * STATE_DIM;       // 780 float = 20 x 39
+int activeEnv = 0;                                      // env nhan chuot/ban phim
 vec2 g(0.0f, -980.6f);
 struct Engine {
     GLFWwindow* window;
@@ -255,13 +266,20 @@ struct Skeleton {
         }
     }
 
-    void step(float dt) {
+    // Ve toan bo bo xuong (dung cho che do render luoi 20 env)
+    void drawAll() {
+        for (Bone* b : bones) b->draw();
+    }
+
+    void step(float dt, bool doDraw = false) {
         // ---- Euler Integrate Gravity & Draw ----
+        // doDraw = true khi chi chay 1 env (che do cu); che do batch khong ve o day
+        // (toan bo 20 env duoc ve 1 lan trong pass render rieng cua main loop)
         for (Bone* b : bones) {
             b->vel += g * dt;
             b->vel    *= 1.0f / (1.0f + 0.7f * dt);
             b->angVel *= 1.0f / (1.0f + 0.7f * dt);
-            b->draw();
+            if (doDraw) b->draw();
         }
         // ---- Solve Joints & Apply Torque---
         for(int i=0;i<50;i++) {
@@ -364,8 +382,20 @@ struct Skeleton {
         }
     }
 };
-// ---- Single controllable skeleton (mo phong 1 khung nguoi duy nhat) ----
-Skeleton* sk = new Skeleton(vec2(400, 60), 0);
+// ---- VECTORIZED: mang 20 bo xuong doc lap ----
+// g_envs[i] la environment thu i; sk la con tro tro den env dang duoc dieu khien
+// bang chuot/ban phim (mac dinh env 0). Toan bo code cu (mouseCtl, circleMass,
+// Data, tempKeyControl) van dung `sk` nen khong phai sua.
+Skeleton* sk = nullptr;
+vector<Skeleton*> g_envs;
+
+void createEnvs() {
+    for (int i = 0; i < NUM_ENVS; i++) {
+        // moi env khoi dong cung vi tri (400, 60) - tuong duong reset ve tu the goc
+        g_envs.push_back(new Skeleton(vec2(400, 60), i));
+    }
+    sk = g_envs[activeEnv];
+}
 
 
 // ------------------------ Interactive Mass ------------------------
@@ -569,12 +599,15 @@ struct MouseController {
 struct Data {
     int sock, sendSock;
     sockaddr_in server, python;
-    const static int revSize = ACTION_DIM;
-    const static int sendSize = STATE_DIM;
+    // Buffer nhan phai co the chua packet batch: header -200 + 200 action float
+    const static int revSize = BATCH_ACTION_DIM;
+    // Buffer gui: che do cu = 39 float, che do batch = 780 float
+    const static int sendSize = BATCH_STATE_DIM;
 
     float recvBuffer[revSize], stateBuffer[sendSize];
     bool enabled = true; // P = bat/tat ket noi UDP
     bool pWas = false;
+    bool batchMode = false; // -101 (batch state) => true; -100 (state env 0) => false
 
     Data() {
         WSADATA wsa;
@@ -615,41 +648,85 @@ struct Data {
 
         if (bytesRead < (int)(2 * sizeof(float))) return false;
 
+        if (bytesRead < (int)(2 * sizeof(float))) return false;
+
         if (recvBuffer[0] == -100.0f) {
-            return true; // python xin state
+            batchMode = false;           // che do cu: xin state cua env 0 (39 float)
+            return true;
+        } else if (recvBuffer[0] == -101.0f) {
+            batchMode = true;            // che do batch: xin state ca 20 env (780 float)
+            return true;
         } else if (recvBuffer[0] == -150.0f) {
             glfwSwapBuffers(engine.window);
             return false;
         } else if (recvBuffer[0] == -69.0f) {
-            sk->reset();
+            sk->reset();                 // che do cu: reset env dang active
+            mouseCtl.clear();
+            return false;
+        } else if (recvBuffer[0] == -102.0f) {
+            // BATCH: reset dung 1 env theo chi so (recvBuffer[1])
+            int idx = (int)recvBuffer[1];
+            if (idx >= 0 && idx < NUM_ENVS) g_envs[idx]->reset();
+            return false;
+        } else if (recvBuffer[0] == -103.0f) {
+            // BATCH: reset TAT CA 20 env (dung khi bat dau 1 luot rollout)
+            for (int i = 0; i < NUM_ENVS; i++) g_envs[i]->reset();
             mouseCtl.clear();
             return false;
         } else if (recvBuffer[0] == -68.0f) {
-            sk->impulse_max = recvBuffer[1];
+            for (int i = 0; i < NUM_ENVS; i++)   // ap dung cho ca 20 env
+                g_envs[i]->impulse_max = recvBuffer[1];
             return false;
+        } else if (recvBuffer[0] == -200.0f &&
+                   bytesRead == (int)(BATCH_ACTION_DIM * sizeof(float))) {
+            // BATCH: 1 packet = header + 20 hang x 10 targetAngle.
+            // Hang i (recvBuffer[1 + i*10 ... +10]) gan cho joints cua env thu i
+            // => neural network chay voi BATCH SIZE = 20, 1 goi UDP duy nhat.
+            for (int e = 0; e < NUM_ENVS; e++) {
+                Skeleton* s = g_envs[e];
+                int n = (int)s->joints.size();
+                for (int j = 0; j < ACTION_DIM && j < n; j++)
+                    s->joints[j].targetAngle = recvBuffer[1 + e * ACTION_DIM + j];
+            }
         } else if (bytesRead == (int)(ACTION_DIM * sizeof(float))) {
-            // action: 10 target angles -> gan vao cac khop
+            // che do cu: 10 target angles -> gan vao cac khop cua env active
             for (int j = 0; j < ACTION_DIM && j < (int)sk->joints.size(); j++)
                 sk->joints[j].targetAngle = recvBuffer[j];
         }
         return false;
     }
 
-    void sendData() {
-        int i = 0;
-        for (Bone* b : sk->bones) {
+    // Dong goi 39 float state cua 1 skeleton vao buffer tai vi tri `base`
+    void fillState(Skeleton* s, int base) {
+        int i = base;
+        for (Bone* b : s->bones) {
             stateBuffer[i++] = sin(b->angle);
             stateBuffer[i++] = cos(b->angle);
             stateBuffer[i++] = b->angVel;
         }
-        stateBuffer[i++] = sk->hip->pos.y / 600.0f;
-        stateBuffer[i++] = sk->hip->pos.x / 800.0f;
-        stateBuffer[i++] = sk->hip->vel.y / 600.0f;
-        stateBuffer[i++] = sk->hip->vel.x / 800.0f;
-        stateBuffer[i++] = (sk->calfL->pos.y - fabsf(sin(sk->calfL->angle)) * sk->calfL->halfLength <= sk->calfL->radius + 1.0f) ? 1.0f : 0.0f;
-        stateBuffer[i++] = (sk->calfR->pos.y - fabsf(sin(sk->calfR->angle)) * sk->calfR->halfLength <= sk->calfR->radius + 1.0f) ? 1.0f : 0.0f;
+        stateBuffer[i++] = s->hip->pos.y / 600.0f;
+        stateBuffer[i++] = s->hip->pos.x / 800.0f;
+        stateBuffer[i++] = s->hip->vel.y / 600.0f;
+        stateBuffer[i++] = s->hip->vel.x / 800.0f;
+        stateBuffer[i++] = (s->calfL->pos.y - fabsf(sin(s->calfL->angle)) * s->calfL->halfLength <= s->calfL->radius + 1.0f) ? 1.0f : 0.0f;
+        stateBuffer[i++] = (s->calfR->pos.y - fabsf(sin(s->calfR->angle)) * s->calfR->halfLength <= s->calfR->radius + 1.0f) ? 1.0f : 0.0f;
+    }
 
-        sendto(sendSock, (char*)stateBuffer, i * sizeof(float), 0, (sockaddr*)&python, sizeof(python));
+    void sendData() {
+        if (batchMode) {
+            // BATCH: dong goi state cua CA 20 bo xuong thanh 1 mang 780 float:
+            //   [env0: 39 float][env1: 39 float] ... [env19: 39 float]
+            // => Python nhan duoc batch (20, 39) cho neural net trong 1 datagram.
+            for (int e = 0; e < NUM_ENVS; e++)
+                fillState(g_envs[e], e * STATE_DIM);
+            sendto(sendSock, (char*)stateBuffer, BATCH_STATE_DIM * sizeof(float), 0,
+                   (sockaddr*)&python, sizeof(python));
+            return;
+        }
+        // che do cu: chi gui state cua env active (39 float)
+        fillState(sk, 0);
+        sendto(sendSock, (char*)stateBuffer, STATE_DIM * sizeof(float), 0,
+               (sockaddr*)&python, sizeof(python));
     }
 };
 Data dataManager;
@@ -727,7 +804,10 @@ int frameInterval = 1; // vẽ mỗi frame - cần cho điều khiển chuột t
 int main() {
     srand(time(0) * 1234567891ULL ^ (uint64_t)clock());
 
-    sk->impulse_max = 0.0f; // tat luc day ngau nhien (che do dieu khien thu cong)
+    // ---- VECTORIZED: tao 20 bo xuong truoc khi vong lap chay ----
+    createEnvs();
+
+    for (Skeleton* s : g_envs) s->impulse_max = 0.0f; // tat luc day ngau nhien (che do dieu khien thu cong)
 
     float dt = 1.0/60.0;
     glfwSwapInterval(1);
@@ -737,14 +817,30 @@ int main() {
 
         tempKeyControl(engine.window);
 
-        // ------ DIEU KHIEN BANG CHUOT ------
+        // ------ DIEU KHIEN BANG CHUOT (chi tren env active) ------
         mouseCtl.update(engine.window, dt);
 
         // ------ NHAN LENH / ACTION TU PYTHON (UDP) ------
         bool gotStateRequest = dataManager.receiveData(engine.window);
 
-        sk->step(dt);
+        // ------ MO PHONG SONG SONG 20 BO XUONG ------
+        // Khong ve trong step(); toan bo 20 env duoc ve 1 lan o pass render
+        // cuoi frame (render batch khong phu thuoc request state tu Python).
+        for (Skeleton* s : g_envs)
+            s->step(dt, false);
+
         circleMass.update(engine.window, dt);
+
+        // ------ PASS RENDER: luoi 4 cot x 5 hang (200x120 moi o, ty le 0.32) ------
+        // Env 0 o goc duoi-trai, env 19 o goc tren-phai. Env active duoc to dam
+        // bang xuong highlight cua mouseCtl (highlight chi ap dung len env active).
+        for (int i = 0; i < NUM_ENVS; i++) {
+            glPushMatrix();
+            glTranslatef(200.0f * (i % 4), 120.0f * (i / 4), 0.0f);
+            glScalef(0.32f, 0.32f, 1.0f);
+            g_envs[i]->drawAll();
+            glPopMatrix();
+        }
 
         // ------ GUI STATE CHO PYTHON (UDP) ------
         if (gotStateRequest)

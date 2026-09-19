@@ -1,29 +1,44 @@
 """
-env_bridge.py - Cau noi UDP (Python <-> env.exe) + HUAN LUYEN REINFORCEMENT LEARNING
+env_bridge.py - Cau noi UDP (Python <-> env.exe) + HUAN LUYEN PPO (Actor-Critic)
 ====================================================================================
 
 CHUONG TRINH NAY LAM GI:
   1. Ket noi toi mo phong vat ly C++ (env.exe) qua UDP.
-  2. Dung mang MLP 2 lop an (PyTorch) lam Policy dieu khien 10 khop cua bo xuong.
-  3. Tu hoc 3 ky nang: giu thang bang (balance), dung thang dung (upright),
-     vuon cao nhat co the (maximize height).
-  4. Toi uu trong so bang loss.backward() + optimizer Adam
-     (Policy Gradient: A2C per-step hoac REINFORCE theo episode).
+  2. Dung kien truc ACTOR-CRITIC voi thuat toan PPO (Proximal Policy Optimization):
+       - ACTOR  (PolicyNet) : chon action cho 10 khop cua bo xuong.
+       - CRITIC (CriticNet) : du doan Value V(s) = return tich luy mong doi.
+  3. MO PHONG SONG SONG 20 BO XUONG trong 1 tien trinh env.exe (vectorized env):
+       - 1 goi UDP gui 20 x 10 targetAngle  -> ca 20 bo xuong cung thuc thi action
+       - 1 goi UDP nhan 20 x 39 float state -> neural net chay voi batch size = 20
+  4. Toi uu bang PPO:
+       - Clipped Surrogate Objective: ratio = prob_new/prob_old, clip [1-eps, 1+eps]
+       - Critic Loss = (V(s) - Return)^2 (Huber)
+       - Advantage bang GAE(lambda): Advantage = Actual Return - Predicted Value
+       - Total Loss = Actor Loss + Critic Loss - Entropy Bonus (khuyen khich kham pha)
 
 ------------------------------------------------------------------------------------
-GIAO THUC UDP (khop voi DataManager trong src/env.cpp - KHONG can sua env.cpp)
+GIAO THUC UDP (khop voi DataManager trong src/env.cpp)
 ------------------------------------------------------------------------------------
   env.exe bind port 5005 (nhan lenh), gui state ve 127.0.0.1:5006.
   Python -> env.exe:
-    [-100.0, 0.0]   xin state (env tra loi bang 39 float)
-    [-150.0, 0.0]   yeu cau ve 1 frame (glfwSwapBuffers)
-    [ -69.0, idx ]  reset skeleton
-    [ -68.0, mag ]  dat impulse_max (luc day ngau nhien; 0 = tat)
-    [ 10 float   ]  targetAngle cho 10 khop (thu tu joints)
-  env.exe -> Python (39 float):
-    11 xuong * [sin(angle), cos(angle), angVel]
-    + hip.pos.y/600, hip.pos.x/800, hip.vel.y/600, hip.vel.x/800
-    + calfL cham dat (1.0/0.0), calfR cham dat (1.0/0.0)
+    [-100.0, 0.0]        xin state env 0 (env tra loi bang 39 float - che do cu)
+    [-101.0, 0.0]        xin state BATCH: env tra loi 780 float = 20 x 39
+    [-150.0, 0.0]        yeu cau ve 1 frame (glfwSwapBuffers)
+    [ -69.0, idx ]       reset env active (che do cu)
+    [-102.0, idx ]       reset dung 1 env thu idx (che do batch)
+    [-103.0, 0.0 ]       reset CA 20 env
+    [ -68.0, mag ]       dat impulse_max (luc day ngau nhien; 0 = tat)
+    [ 10 float   ]       targetAngle cho 10 khop cua env 0 (che do cu)
+    [-200.0, 200 float]  BATCH ACTION: 20 hang x 10 targetAngle cho 20 env
+  env.exe -> Python:
+    che do cu   : 39 float (1 env)
+    che do batch: 780 float = [env0: 39][env1: 39] ... [env19: 39]
+      moi env 39 float gom: 11 xuong * [sin(angle), cos(angle), angVel]
+                            + hip.pos.y/600, hip.pos.x/800, hip.vel.y/600, hip.vel.x/800
+                            + calfL cham dat (1.0/0.0), calfR cham dat (1.0/0.0)
+
+  * SO BO XUONG (NUM_ENVS) PHAI TRUNG KHOP VOI env.cpp (const int NUM_ENVS = 20).
+    Neu doi so luong, phai sua ca hai file.
 
 ------------------------------------------------------------------------------------
 BAN DO 39 FLOAT STATE (thu tu bones trong env.cpp: head, body, armL, armR,
@@ -56,21 +71,28 @@ THU TU 10 KHOP (action) - trung voi vector joints trong env.cpp va STAND ben duo
 ------------------------------------------------------------------------------------
 CACH DUNG
 ------------------------------------------------------------------------------------
-  # 0) Mo env.exe truoc (bat buoc - no la server UDP)
-  # 1) HUAN LUYEN DUNG 1 GIO (het gio tu dong dung va luu checkpoint) - khuyen nghi
+  # 0) Mo env.exe truoc (bat buoc - no la server UDP, chua 20 bo xuong)
+  # 1) HUAN LUYEN PPO SONG SONG 20 BO XUONG - DUNG 1 GIO (khuyen nghi)
   python src/env_bridge.py --mode train --time 1h --no-render --save-every 25 --log-every 100
-  # 1b) CHAY LIEN TUC 10 GIO KHONG NGHI (tu luu dinh ky + tu thu lai khi env.exe
+  # 1b) Chay nhanh theo so update PPO (kiem tra co che hoc hoat dong)
+  python src/env_bridge.py --mode train --episodes 50 --no-render --log-every 10
+  # 1c) CHAY LIEN TUC 10 GIO KHONG NGHI (tu luu dinh ky + tu thu lai khi env.exe
   #     mat ket noi tam thoi trong han --retry, mac dinh 120s)
   python src/env_bridge.py --mode train --time 10h --no-render --save-every 20 --log-every 200
-  # 2) Chay / trinh dien mo hinh da hoc lien tuc trong 1 gio
+  # 2) Chay / trinh dien mo hinh da hoc lien tuc trong 1 gio (env 0)
   python src/env_bridge.py --mode eval --resume rha_policy.pt --time 1h --no-render
-  # 3) Huan luyen theo SO EPISODE thay vi theo thoi gian
-  python src/env_bridge.py --mode train --episodes 200 --steps 300
-  # 4) Chay thu policy da hoc (khong cap nhat trong so)
+  # 3) Chay thu policy da hoc (khong cap nhat trong so)
   python src/env_bridge.py --mode eval --resume rha_policy.pt --steps 600
-  # 5) Che do cu (tuong thich nguoc): di bo bang dao dong sin / dung yen
+  # 4) Che do cu (tuong thich nguoc): di bo bang dao dong sin / dung yen
   python src/env_bridge.py --mode walk --freq 1.5 --amp 1.0 --frames 600
   python src/env_bridge.py --mode stand
+
+  THAM SO PPO QUAN TRONG:
+  * --num-envs 20      : so bo xuong song song (PHAI = NUM_ENVS trong env.cpp)
+  * --rollout 64       : so buoc moi lan thu thap -> buffer = 64 buoc x 20 env = 1280 mau
+  * --clip-eps 0.2     : epsilon cua PPO (clip ratio trong [0.8, 1.2])
+  * --ppo-epochs 4     : so lan quet lai buffer moi lan cap nhat
+  * --gae-lambda 0.95  : he so GAE lam bot phuong sai cua advantage
 
   LUU Y VE THOI GIAN:
   * --time nhan '1h', '30m', '90s', '1.5h', hoac so khong don vi (= PHUT).
@@ -129,12 +151,20 @@ def require_torch():
 # ------------------------------------------------------------------------------------
 # Hang so giao thuc / observation
 # ------------------------------------------------------------------------------------
-STATE_DIM = 39                          # so float env.exe gui ve
+STATE_DIM = 39                          # so float env.exe gui ve cho MOI bo xuong
 ACTION_DIM = 10                         # so khop dieu khien duoc
 ENV_CMD_ADDR = ("127.0.0.1", 5005)      # env.exe nhan lenh tai day
 PY_STATE_ADDR = ("127.0.0.1", 5006)     # Python nhan state tai day
 SOCKET_TIMEOUT = 2.0                    # giay - cho state toi da truoc khi bao loi
 FRAME_DT = 1.0 / 60.0                   # env.cpp dung dt = 1/60 co dinh cho moi buoc vat ly
+
+# ------------------------------------------------------------------------------------
+# VECTORIZED ENVIRONMENT: 20 bo xuong song song trong 1 tien trinh env.exe
+# (PHAI trung khop voi const int NUM_ENVS trong src/env.cpp)
+# ------------------------------------------------------------------------------------
+NUM_ENVS = 20                           # so bo xuong / batch size cua neural net
+BATCH_STATE_DIM = NUM_ENVS * STATE_DIM  # 780 float = 20 env x 39 float
+BATCH_ACTION_DIM = 1 + NUM_ENVS * ACTION_DIM  # header (-200) + 20 x 10 targetAngle
 
 # Thu tu xuong trong state (khop bones[] cua env.cpp)
 BONE_NAMES = ["head", "body", "armL", "armR", "forearmL", "forearmR",
@@ -156,10 +186,14 @@ STAND = [0.0, 4.95, 3.0, 4.0, 0.0, 0.0, 1.0, 2.0, 0.0, 0.0]
 # Chuan hoa observation cho mang neural: moi gia tri ep ve [-1, 1]
 ANG_VEL_SCALE = 20.0     # env.cpp clamp angVel vao [-50, 50] -> chia 20 la dep
 
-CMD_STATE = -100.0       # xin state
+CMD_STATE = -100.0       # xin state (env 0 - che do cu)
+CMD_STATE_BATCH = -101.0 # xin state BATCH (ca 20 env -> 780 float)
 CMD_RENDER = -150.0      # ve 1 frame
-CMD_RESET = -69.0        # reset skeleton
+CMD_RESET = -69.0        # reset env active (che do cu)
+CMD_RESET_ONE = -102.0   # reset dung 1 env theo chi so (che do batch)
+CMD_RESET_ALL = -103.0   # reset ca 20 env
 CMD_IMPULSE = -68.0      # dat impulse_max (0 = tat luc day ngau nhien)
+CMD_ACTION_BATCH = -200.0  # header cua packet batch action (20 x 10 targetAngle)
 
 # ------------------------------------------------------------------------------------
 # Trong so ham thuong (Reward shaping) - chinh tai day neu muon doi "tinh cach" policy
@@ -311,6 +345,75 @@ def render_tick(enabled=True):
     """Yeu cau env.exe ve 1 frame (glfwSwapBuffers) neu cho phep."""
     if enabled:
         send(CMD_RENDER, 0.0)
+
+
+# ====================================================================================
+# 1b) GIAO TIEP UDP BATCH (VECTORIZED 20 ENV)
+# ====================================================================================
+def send_batch_actions(actions):
+    """
+    GUI BATCH ACTION CHO CA 20 BO XUONG TRONG 1 GOI UDP.
+    INPUT : actions - list/tensor (20, 10) gia tri trong (-1, 1) cho 20 env.
+    Packet: [-200.0, a0[0..9], a1[0..9], ..., a19[0..9]] = 201 float.
+
+    Day la "xu ly Batch 20" phia truyen: neural net chay batch=20, ket qua duoc
+    dong goi thanh 1 datagram thay vi 20 goi rieng le.
+    """
+    if torch is not None and isinstance(actions, torch.Tensor):
+        flat = actions.detach().cpu().reshape(-1).tolist()
+    else:
+        flat = [float(v) for row in actions for v in row]
+    if len(flat) != NUM_ENVS * ACTION_DIM:
+        raise ValueError("send_batch_actions: can %d gia tri, nhan %d"
+                         % (NUM_ENVS * ACTION_DIM, len(flat)))
+    cmd_sock.sendto(struct.pack("<%df" % (1 + len(flat)),
+                                CMD_ACTION_BATCH, *flat), ENV_CMD_ADDR)
+
+
+def request_batch_state_retry(retry_seconds=15.0):
+    """
+    XIN STATE BATCH CUA CA 20 BO XUONG (voi tu dong thu lai khi mat ket noi).
+    -> tensor float32 (20, 39) RAW (chua chuan hoa; dung cho compute_reward,
+       chuan hoa boi normalize_state_batch truoc khi vao neural net).
+
+    Packet tra loi: 780 float = [env0: 39][env1: 39] ... [env19: 39]
+    """
+    retry_seconds = max(0.0, float(retry_seconds))
+    outage_start = None
+    while True:
+        try:
+            _drain_state_socket()
+            send(CMD_STATE_BATCH, 0.0)
+            try:
+                data, _ = state_sock.recvfrom(BATCH_STATE_DIM * 4)
+            except (socket.timeout, OSError) as exc:
+                raise EnvNotRunning(
+                    "Khong nhan duoc state batch tu env.exe - hay mo env.exe (ban MOI) truoc!"
+                ) from exc
+            if len(data) < BATCH_STATE_DIM * 4:
+                continue                        # goi tin le -> xin lai
+            vals = struct.unpack("<%df" % BATCH_STATE_DIM, data[: BATCH_STATE_DIM * 4])
+            # ==== XU LY BATCH 20: reshape (780,) -> (20, 39) ====
+            return torch.tensor(vals, dtype=torch.float32).reshape(NUM_ENVS, STATE_DIM)
+        except EnvNotRunning as exc:
+            if outage_start is None:
+                outage_start = time.time()
+                log("[CANH BAO] mat ket noi env.exe: %s" % exc)
+            remaining = retry_seconds - (time.time() - outage_start)
+            if remaining <= 0:
+                raise
+            log("         thu lai sau 2 giay... (con %.0fs trong han --retry)" % remaining)
+            time.sleep(2.0)
+
+
+def reset_env_one(idx):
+    """Reset dung 1 bo xuong thu idx (dung khi env do bi NGUA / done)."""
+    send(CMD_RESET_ONE, float(idx))
+
+
+def reset_env_all():
+    """Reset CA 20 bo xuong ve tu the goc (dung khi bat dau rollout moi)."""
+    send(CMD_RESET_ALL, 0.0)
 
 
 # ====================================================================================
@@ -642,6 +745,253 @@ else:                                   # stub: bao loi ro rang neu thieu PyTorc
         def __init__(self, *args, **kwargs):
             raise SystemExit(TORCH_HINT)
 
+    class CriticNet:
+        def __init__(self, *args, **kwargs):
+            raise SystemExit(TORCH_HINT)
+
+
+# ====================================================================================
+# 5b) MANG CRITIC + PPO AGENT (Actor-Critic song song)
+# ====================================================================================
+if TORCH_AVAILABLE:
+
+    class CriticNet(nn.Module):
+        """
+        CRITIC NETWORK (Mang Phe biet) - song song voi Actor (PolicyNet).
+
+        Nhan state hien tai (batch 20 x 39) va du doan Value V(s) = return
+        tich luy mong doi (expected return). V(s) dung de:
+          - tinh Advantage = Actual Return - Predicted Value
+          - lam baseline giam phuong sai cua policy gradient
+        Trong so critic RIENG HOAN TOAN so voi actor (nhu bai goc PPO,
+        Schulman et al. 2017) de hai mang khong gian lan gradient cua nhau.
+        """
+
+        def __init__(self, state_dim=STATE_DIM, hidden=128):
+            super().__init__()
+            self.fc1 = nn.Linear(state_dim, hidden)
+            self.fc2 = nn.Linear(hidden, hidden)
+            self.value_head = nn.Linear(hidden, 1)
+            self._init_weights()
+
+        def _init_weights(self):
+            for layer in (self.fc1, self.fc2):
+                nn.init.orthogonal_(layer.weight, gain=math.sqrt(2.0))
+                nn.init.zeros_(layer.bias)
+            nn.init.orthogonal_(self.value_head.weight, gain=1.0)
+            nn.init.zeros_(self.value_head.bias)
+
+        def forward(self, state):
+            """state (B, 39) -> V(s) shape (B,)."""
+            h = torch.tanh(self.fc1(state))
+            h = torch.tanh(self.fc2(h))
+            return self.value_head(h).squeeze(-1)
+
+    class PPOAgent:
+        """
+        Goi Actor (PolicyNet) + Critic (CriticNet) + thuat toan PPO.
+
+        Moi lan cap nhat (buffer day `rollout` buoc x 20 env = T*20 mau):
+          1. compute_gae(): tinh Advantage & return cho tung transition.
+          2. ppo_update(): ppo_epochs lan x minibatch:
+               ACTOR  : Clipped Surrogate Objective (ratio = prob_new/prob_old,
+                        clip trong [1-eps, 1+eps], eps mac dinh 0.2)
+               CRITIC : (V(s) - Return)^2 (Huber)
+               TOTAL  = actor + value_coef*critic - entropy_coef*entropy
+        """
+
+        def __init__(self, state_dim=STATE_DIM, action_dim=ACTION_DIM, hidden=128,
+                     lr=3e-4, gamma=0.995, gae_lambda=0.95, clip_eps=0.2,
+                     ppo_epochs=4, num_minibatches=4, entropy_coef=0.002,
+                     value_coef=0.5, max_grad_norm=1.0, device=None,
+                     log_std_init=-1.4, log_std_min=-3.5, log_std_max=-1.0,
+                     huber_beta=5.0):
+            self.actor = PolicyNet(state_dim, action_dim, hidden,
+                                   log_std_init, log_std_min, log_std_max).to(device)
+            self.critic = CriticNet(state_dim, hidden).to(device)
+            self.optimizer = torch.optim.Adam(              # 1 Adam chung 2 mang
+                list(self.actor.parameters()) + list(self.critic.parameters()), lr=lr)
+            self.gamma = gamma
+            self.gae_lambda = gae_lambda
+            self.clip_eps = clip_eps
+            self.ppo_epochs = ppo_epochs
+            self.num_minibatches = num_minibatches
+            self.entropy_coef = entropy_coef
+            self.value_coef = value_coef
+            self.max_grad_norm = max_grad_norm
+            self.device = device
+            self.huber_beta = huber_beta
+
+        # ----------------- ACTOR CHON ACTION (BATCH 20 ENV) -----------------
+        def act(self, states, deterministic=False):
+            """
+            states: (20, 39) -> (action(20,10), logp(20,), value(20,), ent(20,)).
+            CA 20 bo xuong di qua mang CUNG MOT lan forward => batch size = 20.
+            Actor cho action/logp/entropy; CriticNet cho Value V(s) (dung cho GAE).
+            """
+            a, logp, _, ent = self.actor.act(states, deterministic=deterministic)
+            with torch.no_grad():
+                value = self.critic(states)          # V(s) tu CRITIC (khong phai actor)
+            return a, logp, value, ent
+
+        def evaluate(self, states, actions):
+            """
+            Danh gia lai action CU duoi policy MOI (trong vong PPO update).
+            -> (logp_new, entropy, value) - gradient chay tu day.
+            Bien nghich tanh: a = tanh(u) => u = atanh(a) (cong thuc tanh-Gaussian).
+            """
+            mu, log_std, _ = self.actor.forward(states)
+            dist = Normal(mu, log_std.exp())
+            u = torch.atanh(torch.clamp(actions, -1.0 + 1e-6, 1.0 - 1e-6))
+            logp = (dist.log_prob(u) - torch.log(1.0 - actions * actions + 1e-6)).sum(-1)
+            entropy = dist.entropy().sum(-1)
+            value = self.critic(states)
+            return logp, entropy, value
+
+
+        # ------------- TINH ADVANTAGE + RETURN (GAE LAMBDA) -------------
+        def compute_gae(self, rewards, values, next_value, dones):
+            """
+            TINH ADVANTAGE (GAE) rieng cho tung env trong 20 env.
+            INPUT: moi tensor theo thoi gian, shape (T, 20):
+              rewards=r_t | values=V(s_t) (detach) | next_value=V(s_T) | dones=1 neu nga.
+            Cong thuc:
+              delta_t = r_t + gamma*V(s_{t+1})*(1-done_t) - V(s_t)
+              Adv_t   = delta_t + gamma*lambda*(1-done_t)*Adv_{t+1}
+            Trong do r_t + gamma*V(s_{t+1}) la uoc luong "Actual Return" va V(s_t)
+            la "Predicted Value" => Advantage = Actual Return - Predicted Value.
+            Tra ve (adv, returns) voi return_t = Adv_t + V(s_t) (target critic).
+            """
+            T = rewards.shape[0]
+            adv = torch.zeros_like(rewards)
+            gae = torch.zeros_like(rewards[0])
+            for t in reversed(range(T)):
+                next_v = next_value if t == T - 1 else values[t + 1]
+                delta = rewards[t] + self.gamma * next_v * (1.0 - dones[t]) - values[t]
+                gae = delta + self.gamma * self.gae_lambda * (1.0 - dones[t]) * gae
+                adv[t] = gae
+            return adv, adv + values
+
+        # ------------- PPO UPDATE: CLIPPED SURROGATE OBJECTIVE -------------
+        def ppo_update(self, states, actions, logp_old, returns, adv):
+            """
+            Buoc toi uu PPO tren toan buffer (T*20 mau, vi du 64x20 = 1280).
+
+            ACTOR - Clipped Surrogate Objective:
+                ratio   = exp(logp_new - logp_old) = prob_new / prob_old
+                surr    = min(ratio*A, clamp(ratio, 1-eps, 1+eps)*A)
+                L_actor = -mean(surr)   (am vi minh toi uu bang gradient DESCENT)
+            Clip giu ratio trong [1-eps, 1+eps] (eps=0.2) => chinh sach khong bi
+            cap nhat QUA DA trong 1 buoc (on dinh training).
+
+            CRITIC : L_critic = Huber( V(s), Return ) ~ (V(s)-Return)^2
+            TOTAL  = L_actor + value_coef*L_critic - entropy_coef*H (kham pha).
+            """
+            total = adv.numel()                             # vi du 64*20 = 1280
+            # Chuan hoa advantage (zero-mean, unit-std) => gradient on dinh
+            adv_flat = adv.reshape(-1)
+            adv_flat = (adv_flat - adv_flat.mean()) / (adv_flat.std() + 1e-8)
+            s_flat = states.reshape(total, -1)
+            a_flat = actions.reshape(total, -1)
+            logp_old_flat = logp_old.reshape(-1)
+            ret_flat = returns.reshape(-1)
+
+            params = list(self.actor.parameters()) + list(self.critic.parameters())
+            idx_all = torch.randperm(total, device=self.device)
+            mb_size = max(1, total // max(1, self.num_minibatches))
+            stats = {"pi": 0.0, "v": 0.0, "ent": 0.0, "clip": 0.0, "n": 0}
+
+            for _ in range(self.ppo_epochs):
+                for start in range(0, total, mb_size):
+                    mb = idx_all[start:start + mb_size]
+                    if mb.numel() == 0:
+                        continue
+                    logp, entropy, value = self.evaluate(s_flat[mb], a_flat[mb])
+
+                    # ---- PPO CLIPPING LOSS (Clipped Surrogate Objective) ----
+                    ratio = (logp - logp_old_flat[mb]).exp()  # prob_new/prob_old
+                    adv_mb = adv_flat[mb]
+                    surr1 = ratio * adv_mb
+                    surr2 = torch.clamp(ratio, 1.0 - self.clip_eps,
+                                        1.0 + self.clip_eps) * adv_mb
+                    loss_actor = -torch.min(surr1, surr2).mean()
+
+                    # ---- CRITIC LOSS: (V - Return)^2 dang Huber (on dinh hon MSE) ----
+                    loss_critic = F.smooth_l1_loss(value, ret_flat[mb],
+                                                   beta=self.huber_beta)
+
+                    # ---- TOTAL LOSS = actor + critic - entropy bonus ----
+                    loss = (loss_actor + self.value_coef * loss_critic
+                            - self.entropy_coef * entropy.mean())
+
+                    self.optimizer.zero_grad()
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(params, self.max_grad_norm)
+                    self.optimizer.step()
+
+                    with torch.no_grad():
+                        clipped = ((ratio - 1.0).abs() > self.clip_eps).float().mean()
+                        stats["pi"] += float(loss_actor.detach())
+                        stats["v"] += float(loss_critic.detach())
+                        stats["ent"] += float(entropy.mean().detach())
+                        stats["clip"] += float(clipped)
+                        stats["n"] += 1
+
+            n = max(1, stats["n"])
+            return {"loss_pi": stats["pi"] / n, "loss_v": stats["v"] / n,
+                    "entropy": stats["ent"] / n, "clip_frac": stats["clip"] / n}
+
+        def state_dicts(self):
+            """-> (actor_state_dict, critic_state_dict) de luu checkpoint."""
+            return self.actor.state_dict(), self.critic.state_dict()
+
+        def load_dicts(self, actor_sd, critic_sd=None):
+            """Nap trong so (tuong thich ca checkpoint A2C/PPO cu)."""
+            self.actor.load_state_dict(actor_sd)
+            if critic_sd is not None:
+                self.critic.load_state_dict(critic_sd)
+
+    class RolloutBuffer:
+        """
+        BO NHO ROLLOUT CHO PPO: luu (s, a, logp, r, v, done) theo thoi gian.
+        Moi ban ghi la BATCH 20 env => shape (T, 20, ...) voi T = --rollout.
+        Vi du: rollout=64 -> buffer 64 buoc x 20 env = 1280 transition/update.
+        """
+
+        def __init__(self):
+            self.clear()
+
+        def clear(self):
+            self.states, self.actions = [], []
+            self.logp, self.rewards = [], []
+            self.values, self.dones = [], []
+
+        def add(self, states, actions, logp, rewards, values, dones):
+            self.states.append(states.detach().cpu())          # (20, 39)
+            self.actions.append(actions.detach().cpu())        # (20, 10)
+            self.logp.append(logp.detach().cpu())              # (20,)
+            self.rewards.append(torch.as_tensor(rewards, dtype=torch.float32))
+            self.values.append(values.detach().cpu())          # (20,)
+            self.dones.append(torch.as_tensor(dones, dtype=torch.float32))
+
+        def __len__(self):
+            return len(self.states)
+
+        def stack(self):
+            """Ghep list theo thoi gian -> tuple tensor (T, 20, ...)."""
+            return (torch.stack(self.states), torch.stack(self.actions),
+                    torch.stack(self.logp), torch.stack(self.rewards),
+                    torch.stack(self.values), torch.stack(self.dones))
+
+else:                                   # stub neu thieu PyTorch
+    class PPOAgent:
+        def __init__(self, *args, **kwargs):
+            raise SystemExit(TORCH_HINT)
+
+    class RolloutBuffer:
+        def __init__(self, *args, **kwargs):
+            raise SystemExit(TORCH_HINT)
+
 
 def joint_target_from_action(a, stand=None, action_scale=None):
     """
@@ -654,17 +1004,81 @@ def joint_target_from_action(a, stand=None, action_scale=None):
 
 
 # ====================================================================================
-# 6) LUU / NAP CHECKPOINT
+# 6) LUU / NAP CHECKPOINT (PPO: actor + critic)
 # ====================================================================================
 def save_checkpoint(path, policy, meta):
-    """Luu trong so + metadata (de --resume / --mode eval dung lai dung mang)."""
+    """
+    Luu trong so + metadata (de --resume / --mode eval dung lai dung mang).
+    policy co the la PPOAgent (PPO) hoac PolicyNet (checkpoint A2C cu).
+    """
+    if TORCH_AVAILABLE and isinstance(policy, PPOAgent):
+        actor_sd, critic_sd = policy.state_dicts()
+        torch.save({"state_dict": actor_sd, "critic_state_dict": critic_sd,
+                    "meta": dict(meta)}, path)
+        return
     torch.save({"state_dict": policy.state_dict(), "meta": dict(meta)}, path)
 
 
 def load_checkpoint(path, device):
-    """-> (meta, state_dict)."""
+    """-> (meta, state_dict). Nap du ca checkpoint A2C cu va PPO moi."""
     ckpt = torch.load(path, map_location=device)
     return ckpt.get("meta", {}), ckpt["state_dict"]
+
+
+def build_agent(cfg, device):
+    """
+    Tao PPOAgent (Actor + Critic) + nap checkpoint neu co --resume.
+    -> (agent, stand, action_scale, meta)
+    Tuong thich checkpoint cu (A2C): chi nap duoc actor, critic hoc lai tu dau.
+    """
+    meta, actor_sd, critic_sd = {}, None, None
+    if cfg.resume:
+        meta, actor_sd = load_checkpoint(cfg.resume, device)
+        cfg.hidden = int(meta.get("hidden", cfg.hidden))    # checkpoint quyet dinh kien truc
+        try:
+            critic_sd = torch.load(cfg.resume, map_location=device).get("critic_state_dict")
+        except Exception:
+            critic_sd = None
+
+    agent = PPOAgent(state_dim=STATE_DIM, action_dim=ACTION_DIM, hidden=cfg.hidden,
+                     lr=cfg.lr, gamma=cfg.gamma, gae_lambda=cfg.gae_lambda,
+                     clip_eps=cfg.clip_eps, ppo_epochs=cfg.ppo_epochs,
+                     num_minibatches=cfg.minibatches, entropy_coef=cfg.entropy_coef,
+                     value_coef=cfg.value_coef, max_grad_norm=cfg.max_grad_norm,
+                     device=device)
+    if actor_sd is not None:
+        agent.load_dicts(actor_sd, critic_sd)
+
+    stand = list(meta.get("stand", STAND))
+    action_scale = float(meta.get("action_scale", cfg.action_scale))
+    return agent, stand, action_scale, meta
+
+
+def normalize_state_batch(states_raw, device=None):
+    """
+    XU LY BATCH 20: chuan hoa toan bo (20, 39) ve [-1, 1] cho neural net.
+    Goi lai normalize_state() cho tung hang (tung env). Ket qua tensor (20, 39).
+    """
+    out = torch.empty(states_raw.shape, dtype=torch.float32, device=device)
+    for i in range(NUM_ENVS):
+        out[i] = normalize_state(states_raw[i], device)
+    return out
+
+
+def compute_reward_batch(states_raw, x_home):
+    """
+    XU LY BATCH 20: tinh reward cho CA 20 env trong 1 buoc.
+    INPUT : states_raw - tensor (20, 39) RAW (chua chuan hoa angVel).
+    RETURN: (rewards tensor (20,), dones list 20 gia tri 0/1, list 20 info dict).
+    """
+    rewards = torch.empty(NUM_ENVS, dtype=torch.float32)
+    dones, infos = [], []
+    for i in range(NUM_ENVS):
+        r, d, info = compute_reward(states_raw[i].tolist(), x_home[i])
+        rewards[i] = r
+        dones.append(1.0 if d else 0.0)
+        infos.append(info)
+    return rewards, dones, infos
 
 
 # ====================================================================================
@@ -704,9 +1118,17 @@ def print_training_header(cfg, device, action_scale, ep_start):
     log("-" * 104)
     log("  Thiet bi   : %s | mang: 39 -> %d -> %d -> (mu:10 | V:1), tanh xuyen suot"
         % (device, cfg.hidden, cfg.hidden))
+    if cfg.update == "ppo":
+        algo = ("PPO (Clipped Surrogate eps=%g | %d epoch x %d minibatch | GAE lambda=%g)"
+                % (cfg.clip_eps, cfg.ppo_epochs, cfg.minibatches, cfg.gae_lambda))
+    elif cfg.update == "online":
+        algo = "A2C (cap nhat moi buoc)"
+    else:
+        algo = "REINFORCE theo episode"
     log("  Algorithm  : %s%s"
-        % ("A2C (cap nhat moi buoc)" if cfg.update == "online" else "REINFORCE theo episode",
-           "" if not cfg.no_baseline else " + KHONG dung baseline"))
+        % (algo, "" if not cfg.no_baseline else " + KHONG dung baseline"))
+    log("  Moi truong : %d bo xuong song song trong 1 env.exe (batch neural net = %d)"
+        % (NUM_ENVS, NUM_ENVS))
     log("  Optimizer  : Adam(lr=%g) | gamma=%g | entropy_coef=%g | grad_clip=%g"
         % (cfg.lr, cfg.gamma, cfg.entropy_coef, cfg.max_grad_norm))
     log("  Critic     : V(s) du doan return chiet khau; value loss duoc chia cho phuong sai target")
@@ -742,8 +1164,163 @@ def save_state(cfg, policy, ckpt_meta, episode, best_height, reason=""):
         % (cfg.save, episode, best_height, (" - " + reason) if reason else ""))
 
 
+def run_training_ppo(cfg):
+    """
+    HUAN LUYEN PPO SONG SONG 20 BO XUONG (vectorized environment).
+
+    Vong lap moi lan cap nhat (1 "update"):
+      1. THU THAP ROLLOUT: `rollout` buoc; moi buoc
+           - actor chon action cho CA 20 env trong 1 lan forward (batch = 20)
+           - gui 1 goi UDP 20x10 targetAngle -> env.exe mo phong 20 bo xuong
+           - nhan 1 goi UDP 780 float -> tensor (20, 39)
+           - tinh reward cho 20 env (compute_reward_batch)
+           - env nao nga (done) -> tu dong reset lai (reset_env_one)
+      2. Khi buffer du (rollout x 20 transition):
+           - compute_gae(): tinh Advantage = Actual Return - Predicted Value
+           - ppo_update(): Clipped Surrogate Objective + Critic Loss + Entropy
+    """
+    require_torch()
+    torch.manual_seed(cfg.seed)
+    device = resolve_device(cfg.device)
+
+    agent, stand, action_scale, meta = build_agent(cfg, device)
+    stand_t = torch.tensor(stand, dtype=torch.float32, device=device)
+
+    ep_start = int(meta.get("saved_episode", -1)) + 1
+    ckpt_meta = {
+        "stand": list(stand), "action_scale": action_scale, "hidden": cfg.hidden,
+        "state_dim": STATE_DIM, "action_dim": ACTION_DIM,
+        "algorithm": "ppo", "num_envs": NUM_ENVS, "rollout": cfg.rollout,
+        "clip_eps": cfg.clip_eps, "gae_lambda": cfg.gae_lambda,
+        "ppo_epochs": cfg.ppo_epochs,
+        "reward_weights": {"height": W_HEIGHT, "upright": W_UPRIGHT, "stability": W_STABILITY,
+                           "balance": W_BALANCE, "center": W_CENTER, "alive": W_ALIVE,
+                           "fall_penalty": FALL_PENALTY, "fall_height": FALL_HEIGHT,
+                           "height_floor": HEIGHT_FLOOR, "height_ref": HEIGHT_REF,
+                           "tilt_tol_deg": TILT_TOL_DEG},
+        "best_mean_height": float(meta.get("best_mean_height", -1e9)),
+    }
+    print_training_header(cfg, device, action_scale, ep_start)
+
+    best_height = ckpt_meta["best_mean_height"]
+    budget = TimeBudget(cfg.time_seconds) if cfg.time_seconds else None
+    total_steps, total_updates, t_start = 0, 0, time.time()
+    upd, time_up = ep_start - 1, False
+    w_reward, w_height = Window(20), Window(20)
+    ep_reward = [0.0] * NUM_ENVS                 # reward cong don hien tai cua tung env
+    ep_len = [0] * NUM_ENVS                      # do dai episode hien tai cua tung env
+
+    try:
+        # ================= Bat dau: reset CA 20 bo xuong ve tu the goc =================
+        reset_env_all()
+        render_tick(not cfg.no_render)
+        time.sleep(FRAME_DT)
+        raw = request_batch_state_retry(cfg.retry_seconds)       # (20, 39) RAW
+        x_home = [float(raw[i][IDX_HIP_POS_X]) for i in range(NUM_ENVS)]
+        buffer = RolloutBuffer()
+
+        while True:
+            if upd - ep_start + 1 >= cfg.episodes:
+                log("[DUNG] da chay du %d update PPO theo --episodes." % cfg.episodes)
+                break
+            if budget is not None and budget.expired():
+                log("[DUNG] da het thoi gian %s." % hhmmss(budget.total))
+                break
+
+            # ---------------- THU THAP ROLLOUT: `rollout` buoc x 20 env ----------------
+            for t in range(cfg.rollout):
+                # 1. Neural net chon action cho CA 20 env CUNG LUC (batch size = 20)
+                s = normalize_state_batch(raw, device)           # (20, 39) chuan hoa
+                with torch.no_grad():
+                    a, logp, v, _ = agent.act(s)                 # (20,10),(20,),(20,)
+
+                # 2. Gui 1 goi UDP duy nhat: 20 x 10 targetAngle cho 20 bo xuong
+                send_batch_actions(stand_t + action_scale * a)
+
+                # 3. Mo phong 1 buoc vat ly + nhan state batch (20, 39)
+                raw_next = request_batch_state_retry(cfg.retry_seconds)
+                render_tick(not cfg.no_render)
+
+                # 4. Reward cho 20 env; env nao nga (done) -> tu dong reset
+                rewards, dones, infos = compute_reward_batch(raw_next, x_home)
+                # ==== XU LY BATCH 20: 1 ban ghi buffer chua transition cua CA 20 env ====
+                buffer.add(s, a, logp, rewards.tolist(), v, dones)
+                for i in range(NUM_ENVS):
+                    ep_reward[i] += rewards[i].item()
+                    ep_len[i] += 1
+                    if dones[i]:
+                        w_reward.add(ep_reward[i])               # tong ket episode cua env i
+                        reset_env_one(i)                         # reset lai bo xuong i
+                        ep_reward[i] = 0.0
+                        ep_len[i] = 0
+                w_height.add(sum(inf["hip_y"] for inf in infos) / NUM_ENVS)
+
+                raw = raw_next
+                total_steps += NUM_ENVS                          # 20 env * 1 buoc vat ly
+                if not cfg.quiet and t % cfg.log_every == 0:
+                    log("[PPO upd %6d] step %3d/%3d | r_step TB=%+.3f | h TB=%.3f | "
+                        "R ep TB=%+.2f | falls=%d | v=%.2f"
+                        % (upd + 1, t + 1, cfg.rollout,
+                           sum(inf["total"] for inf in infos) / NUM_ENVS,
+                           sum(inf["hip_y"] for inf in infos) / NUM_ENVS,
+                           sum(ep_reward) / NUM_ENVS,
+                           sum(1.0 for d in dones if d > 0.5),
+                           float(v.mean())))
+                time.sleep(FRAME_DT)                             # giu nhip ~60Hz voi env.exe
+                if budget is not None and budget.expired():      # het gio giua rollout
+                    time_up = True
+                    break
+
+            # ---------------- PPO UPDATE tren buffer (T x 20 transition) ----------------
+            s_last = normalize_state_batch(raw, device)
+            with torch.no_grad():
+                next_value = agent.critic(s_last)                # V(s_T) de bootstrap
+            states, actions, logp_old, rewards, values, dones = buffer.stack()
+            states, actions = states.to(device), actions.to(device)
+            logp_old, rewards = logp_old.to(device), rewards.to(device)
+            values, dones = values.to(device), dones.to(device)
+
+            # ==== TINH ADVANTAGE (GAE) + RETURN cho ca 20 env ====
+            adv, returns = agent.compute_gae(rewards, values, next_value, dones)
+
+            # ==== PPO UPDATE: clipped surrogate + critic loss + entropy bonus ====
+            stats = agent.ppo_update(states, actions, logp_old, returns, adv)
+            buffer.clear()
+            upd += 1
+            total_updates += 1
+
+            log("[PPO upd %6d] LOSS pi=%+.4f v=%+.4f ent=%.3f | clip_frac=%.2f | "
+                "r ep TB=%+.2f | h TB=%.3f | %.1f transition/giay"
+                % (upd, stats["loss_pi"], stats["loss_v"], stats["entropy"],
+                   stats["clip_frac"], w_reward.mean, w_height.mean,
+                   total_steps / max(time.time() - t_start, 1e-9)))
+
+            if w_height.mean > best_height:                      # cap nhat best
+                best_height = w_height.mean
+                ckpt_meta["best_mean_height"] = best_height
+            if upd % cfg.save_every == 0:
+                save_state(cfg, agent, ckpt_meta, upd, best_height, "dinh ky --save-every")
+            if budget is not None and time.time() - t_start >= 60.0:
+                log(budget.progress_line("upd %d | %d buoc vat ly (x20 env)"
+                                         % (upd, total_steps)))
+
+    except KeyboardInterrupt:
+        log("[STOP] nguoi dung dung chuong trinh - luu checkpoint truoc khi thoat.")
+    except EnvNotRunning as exc:
+        log("[LOI] %s" % exc)
+    finally:
+        save_state(cfg, agent, ckpt_meta, upd, best_height, "ket thuc phien")
+        elapsed = time.time() - t_start
+        log("TONG KET PPO: %d update | %d buoc vat ly (x20 env) | r ep TB=%+.2f | h TB=%.3f"
+            % (total_updates, total_steps, w_reward.mean, w_height.mean))
+        log("Thoi gian da chay: %s | %.1f transition/giay (batch 20 env)"
+            % (hhmmss(elapsed), total_steps / max(elapsed, 1e-9)))
+
+
 def run_training(cfg):
-    """Vong lap huan luyen: tuong tac env.exe -> thu thap (s, a, r, s') -> loss.backward() -> Adam."""
+    """Vong lap huan luyen A2C/REINFORCE (che do cu, tuong thich nguoc)."""
+    if cfg.update == "ppo":                  # PPO = kien truc moi (mac dinh)
+        return run_training_ppo(cfg)
     require_torch()
     torch.manual_seed(cfg.seed)
     device = resolve_device(cfg.device)
@@ -1007,8 +1584,9 @@ def run_eval(cfg):
     """Chay policy o che do deterministic (a = tanh(mu)) de danh gia ky nang da hoc."""
     require_torch()
     device = resolve_device(cfg.device)
-    policy, stand, action_scale, meta = build_policy(cfg, device)
-    policy.eval()
+    agent, stand, action_scale, meta = build_agent(cfg, device)
+    agent.actor.eval()                       # chinh xac: khong dropout (tanh nen khong anh huong)
+    agent.critic.eval()
 
     log("=" * 104)
     log("XEM THU POLICY: %s | thiet bi=%s | action_scale=%g" % (cfg.resume or "(mang moi, chua hoc)", device, action_scale))
@@ -1044,7 +1622,7 @@ def run_eval(cfg):
             for t in range(cfg.steps):
                 state_t = normalize_state(raw, device)
                 with torch.no_grad():
-                    action, _, _, _ = policy.act(state_t, deterministic=True)
+                    action, _, _, _ = agent.act(state_t, deterministic=True)
                 send(*joint_target_from_action(action, stand, action_scale))
                 raw_next = request_state_retry(cfg.retry_seconds)
                 render_tick(not cfg.no_render)
@@ -1234,26 +1812,21 @@ def run_stand(cfg):
 # ====================================================================================
 EPILOG = """\
 Vi du:
-  # 0) Mo env.exe truoc (no la server UDP: nhan lenh o port 5005, gui state ve 5006)
-  # 1) HUAN LUYEN DUNG 1 GIO - het gio tu dong dung va luu checkpoint
+  # 0) Mo env.exe truoc (no la server UDP: nhan lenh o port 5005, gui state ve 5006;
+  #    mo phong song song 20 bo xuong, hien thi luoi 4x5)
+  # 1) HUAN LUYEN PPO SONG SONG 20 BO XUONG - DUNG 1 GIO (khuyen nghi)
   python src/env_bridge.py --mode train --time 1h --no-render --save-every 25 --log-every 100
-  # 1b) CHAY LIEN TUC 10 GIO KHONG NGHI (mo env.exe + nhan phim Y truoc khi chay)
+  # 1b) Chay nhanh kiem tra (50 update PPO, moi update 64 buoc x 20 env = 1280 mau)
+  python src/env_bridge.py --mode train --episodes 50 --no-render --log-every 10
+  # 1c) CHAY LIEN TUC 10 GIO KHONG NGHI (mo env.exe + nhan phim Y truoc khi chay)
   python src/env_bridge.py --mode train --time 10h --no-render --save-every 20 --log-every 200
-  # 1c) May bi tat giua chung? Mo lai env.exe roi hoc TIEP 10 gio nua
+  # 1d) Hoc tiep tu checkpoint cu (PPO: luu ca actor + critic)
   python src/env_bridge.py --mode train --resume rha_policy.pt --time 10h --no-render
-  # 2) Chay / trinh dien mo hinh da hoc lien tuc 1 gio
-  python src/env_bridge.py --mode eval --resume rha_policy.pt --time 1h --no-render
-  # 3) Huan luyen theo so episode (A2C, cap nhat moi buoc)
-  python src/env_bridge.py --mode train --episodes 300 --steps 300 --lr 3e-4
-  # 4) Huan luyen kieu REINFORCE theo episode (loss.backward() 1 lan/episode)
-  python src/env_bridge.py --mode train --update episode --episodes 300 --steps 300
-  # 5) Hoc tiep tu checkpoint cu (van gioi han 1h neu truyen --time)
-  python src/env_bridge.py --mode train --resume rha_policy.pt --time 1h
-  # 6) Xem policy da hoc (greedy, khong hoc)
+  # 2) Xem policy da hoc (greedy, khong hoc - chi dung env 0 + giao thuc cu)
   python src/env_bridge.py --mode eval --resume rha_policy.pt --steps 600 --episodes 3
-  # 7) Tang toc: --no-render + nhan phim Y trong cua so env.exe (frameInterval=8)
-  python src/env_bridge.py --mode train --no-render --episodes 300
-  # 8) Che do cu: di bo bang dao dong sin / dung yen
+  # 3) Chinh tham so PPO
+  python src/env_bridge.py --mode train --clip-eps 0.2 --rollout 64 --ppo-epochs 4 --lr 3e-4
+  # 4) Che do cu: di bo bang dao dong sin / dung yen
   python src/env_bridge.py --mode walk --freq 1.5 --amp 1.0 --frames 600
   python src/env_bridge.py --mode stand --frames 600
 """
@@ -1286,8 +1859,26 @@ def parse_args(argv=None):
     p.add_argument("--hidden", type=int, default=128, help="so neuron moi lop an (mac dinh 128)")
     p.add_argument("--action-scale", type=float, default=0.35,
                    help="bien do lech quanh STAND, rad: action = STAND + scale*tanh(policy)")
-    p.add_argument("--update", choices=["online", "episode"], default="online",
-                   help="online = A2C cap nhat tung buoc | episode = REINFORCE cap nhat cuoi episode")
+    p.add_argument("--update", choices=["ppo", "online", "episode"], default="ppo",
+                   help="ppo = PPO 20 env song song (MAC DINH) | online = A2C tung buoc (che do cu) | "
+                        "episode = REINFORCE cuoi episode (che do cu)")
+    # ---- Tham so PPO (khi --update ppo) ----
+    p.add_argument("--num-envs", type=int, default=NUM_ENVS,
+                   help="[ppo] so bo xuong song song - PHAI bang NUM_ENVS trong env.cpp (=%d)"
+                        % NUM_ENVS)
+    p.add_argument("--rollout", type=int, default=64,
+                   help="[ppo] so buoc thu thap buffer: %d buoc x %d env = %d mau/update"
+                        % (64, NUM_ENVS, 64 * NUM_ENVS))
+    p.add_argument("--clip-eps", type=float, default=0.2,
+                   help="[ppo] epsilon cua Clipped Surrogate (ratio trong [1-eps, 1+eps])")
+    p.add_argument("--ppo-epochs", type=int, default=4,
+                   help="[ppo] so lan quet lai buffer trong 1 update")
+    p.add_argument("--gae-lambda", type=float, default=0.95,
+                   help="[ppo] he so GAE lambda (lam bot phuong sai advantage)")
+    p.add_argument("--value-coef", type=float, default=0.5,
+                   help="[ppo] he so critic loss trong total loss")
+    p.add_argument("--minibatches", type=int, default=4,
+                   help="[ppo] so minibatch moi epoch PPO")
     p.add_argument("--entropy-coef", type=float, default=0.002,
                    help="he so entropy (kham pha). log_std la tham so dung chung nen he so nay "
                         "phai NHO, neu khong sigma se bi day len tran va policy khong hoi tu")
@@ -1314,6 +1905,15 @@ def parse_args(argv=None):
     cfg = p.parse_args(argv)
     cfg.steps = max(1, int(cfg.steps))          # tranh vong lap rong
     cfg.log_every = max(1, int(cfg.log_every))
+    cfg.rollout = max(1, int(cfg.rollout))
+    cfg.ppo_epochs = max(1, int(cfg.ppo_epochs))
+    cfg.minibatches = max(1, int(cfg.minibatches))
+
+    # So env phai trung khop env.cpp (NUM_ENVS la so bo xuong trong 1 tien trinh)
+    if cfg.num_envs != NUM_ENVS:
+        log("[CANH BAO] --num-envs=%d khong khop NUM_ENVS=%d trong env.cpp -> dung %d."
+            % (cfg.num_envs, NUM_ENVS, NUM_ENVS))
+        cfg.num_envs = NUM_ENVS
 
     # ---- Xu ly --time (vi du '1h') va gioi han episode ----
     cfg.time_seconds = parse_duration(cfg.time) if cfg.time is not None else None
